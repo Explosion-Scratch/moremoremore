@@ -1,0 +1,218 @@
+#!/usr/bin/env bun
+
+import { promisify } from "node:util";
+import { exec as execCallback } from "node:child_process";
+import meow from "meow";
+import chalk from "chalk";
+import "dotenv/config";
+import { writeFile } from "node:fs/promises";
+
+let GOOD_MODEL = "gpt-4o-mini";
+const LAST_ITERATION_MODEL = "gpt-4o-mini";
+const FAST_MODEL = "gpt-4o-mini";
+let SYS = "";
+let conversationHistory = [];
+
+const exec = promisify(execCallback);
+
+const cli = meow(
+  `
+  ${chalk.bold("Usage")}
+    $ askllm <question> [options]
+
+  ${chalk.bold("Options")}
+    --makeIt, -m    How to improve the response (uses AI if not provided)
+    --iterations, -i Number of improvement iterations (default: 4)
+    --systemPrompt, -s System prompt to use for AI responses
+    --initialOutput, -o Output initial response to markdown file
+    --finalOutput, -f Output final response to markdown file
+
+  ${chalk.bold("Examples")}
+    $ askllm "Write a function to sort numbers" --makeIt "more efficient"
+    $ askllm "How do I parse JSON?" -i 2
+    $ askllm "Explain promises in JavaScript"
+    $ askllm "Write docs" --systemPrompt "You are a technical writer"
+    $ askllm "Explain React" --initialOutput initial.md --finalOutput final.md
+`,
+  {
+    importMeta: import.meta,
+    flags: {
+      makeIt: {
+        type: "string",
+        shortFlag: "m",
+      },
+      iterations: {
+        type: "number",
+        shortFlag: "i",
+        default: 4,
+      },
+      systemPrompt: {
+        type: "string",
+        shortFlag: "s",
+      },
+      initialOutput: {
+        type: "string",
+        shortFlag: "o",
+      },
+      finalOutput: {
+        type: "string",
+        shortFlag: "f",
+      },
+    },
+  },
+);
+
+const ask = async ({
+  save = true,
+  question,
+  system,
+  model = FAST_MODEL,
+  cont = false,
+}) => {
+  if (!cont) {
+    // Reset conversation history for new conversations
+    conversationHistory = [];
+  }
+
+  // Build messages array from conversation history
+  const messages = [...conversationHistory];
+
+  // Add system message before each question if provided
+  if (system) {
+    messages.push({ role: "system", content: system });
+  }
+
+  // Add the new user message
+  messages.push({ role: "user", content: question });
+
+  console.log(chalk.dim("Sending request to Groq API..."));
+
+  const response = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: model,
+      messages: messages,
+    }),
+  });
+
+  if (!response.ok) {
+    console.log(await response.text());
+    throw new Error(`API request failed: ${response.statusText}`);
+  }
+
+  const data = await response.json();
+  const assistantMessage = data.choices[0].message;
+  console.log(
+    chalk.dim(`\nReceived ${assistantMessage.content.length} chars response`),
+  );
+
+  if (save) {
+    // Save both the user's question and assistant's response to conversation history
+    if (!conversationHistory.find((m) => m.role === "system")) {
+      // Only add system message once if it exists
+      const systemMsg = messages.find((m) => m.role === "system");
+      if (systemMsg) {
+        conversationHistory.push(systemMsg);
+      }
+    }
+    conversationHistory.push({ role: "user", content: question });
+    conversationHistory.push(assistantMessage);
+  }
+
+  return assistantMessage.content;
+};
+
+const generateImprovementType = async (question, answer) => {
+  const systemPrompt =
+    'Given a user question, generate a single improvement suggestion like "Make it faster", or "Make it clearer" or "Write better code". Focus on what would make the answer significantly better. Answer in 5 words or less. Be extremely concise.';
+  const response = await ask({
+    question: `Generate an improvement suggestion for this question: "${question}, based on this answer: ${answer}"`,
+    system: systemPrompt,
+    save: false,
+  });
+  return response.replace(/^["'\s]+|["'\s]+$/g, "");
+};
+
+const improveAnswer = async (answer, question, improvementType) => {
+  const systemPrompt = `${SYS}You are improving the previous response. Focus on the specified improvement while maintaining accuracy. You will be fined $100 if you fail to do so. Be very concise. Synthesize information well. Original question: ${question}.`;
+  const improvementPrompt = `${improvementType}`;
+  return ask({
+    question: improvementPrompt,
+    system: systemPrompt,
+    model: GOOD_MODEL,
+    cont: true,
+  });
+};
+
+const main = async () => {
+  try {
+    if (!cli.input.length) {
+      console.log(chalk.red("Please provide a question"));
+      process.exit(1);
+    }
+    if (cli.flags.systemPrompt) {
+      SYS = `${cli.flags.systemPrompt} `;
+    }
+
+    const question = cli.input.join(" ");
+
+    console.log(chalk.blue("Getting initial answer..."));
+    let currentAnswer = await ask({
+      question,
+      system:
+        SYS ||
+        "You are a helpful assistant focused on providing clear, accurate answers",
+      model: GOOD_MODEL,
+    });
+
+    console.log(chalk.green("\nInitial Answer:"));
+    console.log(currentAnswer);
+
+    if (cli.flags.initialOutput) {
+      await writeFile(cli.flags.initialOutput, currentAnswer);
+      console.log(
+        chalk.blue(`Initial answer written to ${cli.flags.initialOutput}`),
+      );
+    }
+
+    for (let i = 0; i < cli.flags.iterations; i++) {
+      const improvementType =
+        cli.flags.makeIt ||
+        (await generateImprovementType(question, currentAnswer));
+
+      console.log(
+        chalk.blue(
+          `\nImprovement ${i + 1}/${cli.flags.iterations}: ${improvementType}`,
+        ),
+      );
+      if (i === cli.flags.iterations - 2) {
+        GOOD_MODEL = LAST_ITERATION_MODEL;
+      }
+
+      currentAnswer = await improveAnswer(
+        currentAnswer,
+        question,
+        improvementType,
+      );
+
+      console.log(chalk.green(`\nImproved Answer (${i + 1}):`));
+      console.log(currentAnswer);
+    }
+
+    if (cli.flags.finalOutput) {
+      await writeFile(cli.flags.finalOutput, currentAnswer);
+      console.log(
+        chalk.blue(`Final answer written to ${cli.flags.finalOutput}`),
+      );
+    }
+  } catch (error) {
+    console.error(chalk.red("Error:"), error.message);
+    process.exit(1);
+  }
+};
+
+main();
